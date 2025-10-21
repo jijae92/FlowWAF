@@ -1,35 +1,48 @@
--- TODO: This query depends on the final schemas of waf_hotspots and vpc_hotspots.
--- It needs to be adjusted to unify the columns (e.g., using NULL for missing fields).
-
 -- Combines WAF and VPC hotspots into a single view with a common schema.
 -- This allows the analytics layer to process them uniformly.
+-- Detector will substitute ${database_name}, ${LOOKBACK_MINUTES}, ${TOP_K}
 
-WITH waf_data AS (
+WITH waf_hotspots AS (
     SELECT
-        'WAF' AS source,
-        ip,
-        country,
-        ua,
-        uri,
-        NULL AS dstport,
-        NULL AS action,
-        request_count AS event_count,
-        NULL AS bytes
-    FROM ${waf_hotspots_table}
+        CAST(date_trunc('minute', from_unixtime(timestamp / 1000)) AS VARCHAR) AS minute,
+        httpRequest.clientIp AS key,
+        httpRequest.uri AS subkey,
+        httpRequest.country AS country,
+        (SELECT name FROM UNNEST(labels) LIMIT 1) AS rule_label,
+        COUNT(*) AS value,
+        'request_count' AS metric,
+        'WAF' AS source_type
+    FROM
+        `${database_name}`.`waf_logs`
+    WHERE
+        dt = CAST(date_format(NOW() - INTERVAL '${LOOKBACK_MINUTES}' MINUTE, '%Y-%m-%d') AS VARCHAR)
+        AND hr >= CAST(date_format(NOW() - INTERVAL '${LOOKBACK_MINUTES}' MINUTE, '%H') AS VARCHAR)
+        AND from_unixtime(timestamp / 1000) >= (NOW() - INTERVAL '${LOOKBACK_MINUTES}' MINUTE)
+    GROUP BY
+        1, 2, 3, 4, 5
+    LIMIT ${TOP_K}
 ),
-vpc_data AS (
+vpc_hotspots AS (
     SELECT
-        'VPC' AS source,
-        srcaddr AS ip,
+        CAST(date_trunc('minute', from_unixtime(start)) AS VARCHAR) AS minute,
+        srcaddr AS key,
+        CAST(dstport AS VARCHAR) AS subkey, -- Cast to VARCHAR for union compatibility
         NULL AS country,
-        NULL AS ua,
-        NULL AS uri,
-        dstport,
-        action,
-        packet_count AS event_count,
-        bytes
-    FROM ${vpc_hotspots_table}
+        NULL AS rule_label,
+        COUNT(*) AS value,
+        'connection_count' AS metric,
+        'VPC' AS source_type
+    FROM
+        `${database_name}`.`vpc_flow_logs`
+    WHERE
+        dt = CAST(date_format(NOW() - INTERVAL '${LOOKBACK_MINUTES}' MINUTE, '%Y-%m-%d') AS VARCHAR)
+        AND hr >= CAST(date_format(NOW() - INTERVAL '${LOOKBACK_MINUTES}' MINUTE, '%H') AS VARCHAR)
+        AND from_unixtime(start) >= (NOW() - INTERVAL '${LOOKBACK_MINUTES}' MINUTE)
+    GROUP BY
+        1, 2, 3, 4, 5
+    LIMIT ${TOP_K}
 )
-SELECT * FROM waf_data
+SELECT * FROM waf_hotspots
 UNION ALL
-SELECT * FROM vpc_data;
+SELECT * FROM vpc_hotspots
+ORDER BY minute, source_type, value DESC;

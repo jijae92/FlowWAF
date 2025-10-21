@@ -1,21 +1,24 @@
--- TODO: Define views for easier querying, potentially to abstract away raw log formats.
+-- Views for WAF and VPC Flow Logs to simplify querying and provide a consistent time range.
 
--- Example View for WAF Logs
-CREATE OR REPLACE VIEW waf_logs_view AS
+-- View for WAF logs, slicing data for the last 2 hours.
+CREATE OR REPLACE VIEW `${database_name}`.`slice_waf` AS
 SELECT
     from_unixtime(timestamp / 1000) AS event_time,
     httpRequest.clientIp AS client_ip,
     httpRequest.country AS country,
-    httpRequest.uri AS uri,
     (SELECT value FROM UNNEST(httpRequest.headers) WHERE name = 'User-Agent') AS user_agent,
+    httpRequest.uri AS uri,
     terminatingRule.action AS rule_action,
-    terminatingRule.ruleId AS rule_id
+    terminatingRule.ruleId AS rule_id,
+    (SELECT name FROM UNNEST(labels) LIMIT 1) AS label
 FROM
-    ${waf_logs_table};
+    `${database_name}`.`waf_logs`
+WHERE
+    -- Filter for the last 2 hours based on event_time
+    from_unixtime(timestamp / 1000) >= (NOW() - INTERVAL '2' HOUR);
 
-
--- Example View for VPC Flow Logs
-CREATE OR REPLACE VIEW vpc_flow_logs_view AS
+-- View for VPC Flow logs, slicing data for the last 2 hours.
+CREATE OR REPLACE VIEW `${database_name}`.`slice_vpc` AS
 SELECT
     from_unixtime(start) AS start_time,
     from_unixtime("end") AS end_time,
@@ -29,4 +32,7 @@ SELECT
     action,
     log_status
 FROM
-    ${vpc_flow_logs_table};
+    `${database_name}`.`vpc_flow_logs`
+WHERE
+    -- Filter for the last 2 hours based on start_time
+    from_unixtime(start) >= (NOW() - INTERVAL '2' HOUR);

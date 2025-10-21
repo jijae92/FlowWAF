@@ -1,27 +1,24 @@
--- Aggregates WAF logs to find hotspots within a given time window.
--- This identifies top talkers by IP, country, User-Agent, and URI.
+-- Aggregates WAF logs to find hotspots within the last ${LOOKBACK_MINUTES} minutes.
+-- Detector will substitute ${LOOKBACK_MINUTES} with the actual value.
 
 SELECT
-    httpRequest.clientIp AS ip,
+    CAST(date_trunc('minute', from_unixtime(timestamp / 1000)) AS VARCHAR) AS minute,
+    httpRequest.clientIp AS key,
+    httpRequest.uri AS subkey,
     httpRequest.country AS country,
-    (SELECT value FROM UNNEST(httpRequest.headers) WHERE name = 'User-Agent') AS ua,
-    httpRequest.uri AS uri,
-    -- Extract the primary rule label if it exists
-    (SELECT name FROM UNNEST(labels) LIMIT 1) AS label,
-    COUNT(*) AS request_count
+    (SELECT name FROM UNNEST(labels) LIMIT 1) AS rule_label,
+    COUNT(*) AS value,
+    'request_count' AS metric
 FROM
-    ${waf_logs_table}
+    `${database_name}`.`waf_logs`
 WHERE
     -- Partition pruning for efficiency
-    -- This assumes Firehose delivers logs into a YYYY/MM/DD/HH/ structure
-    year = CAST(YEAR(NOW()) AS VARCHAR)
-    AND month = CAST(MONTH(NOW()) AS VARCHAR)
-    AND day = CAST(DAY(NOW()) AS VARCHAR)
-    AND hour = CAST(HOUR(NOW()) AS VARCHAR)
-    -- Filter for the last 15 minutes
-    AND from_unixtime(timestamp / 1000) BETWEEN (NOW() - INTERVAL '15' MINUTE) AND NOW()
+    -- Detector will substitute dt and hr with calculated values.
+    dt = CAST(date_format(NOW() - INTERVAL '${LOOKBACK_MINUTES}' MINUTE, '%Y-%m-%d') AS VARCHAR)
+    AND hr >= CAST(date_format(NOW() - INTERVAL '${LOOKBACK_MINUTES}' MINUTE, '%H') AS VARCHAR)
+    AND from_unixtime(timestamp / 1000) >= (NOW() - INTERVAL '${LOOKBACK_MINUTES}' MINUTE)
 GROUP BY
     1, 2, 3, 4, 5
 ORDER BY
-    request_count DESC
-LIMIT 100;
+    value DESC
+LIMIT ${TOP_K}; -- Detector will substitute ${TOP_K}

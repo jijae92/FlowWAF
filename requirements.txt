@@ -1,12 +1,8 @@
-# Core
 boto3
-pyyaml
-requests
-
-# Analytics
 pandas
-numpy
-
-# Testing
-pytest
-moto[s3,sns,dynamodb,sts]
+pyarrow
+s3fs
+requests
+python-dateutil
+pyyaml
+awswrangler==3.*

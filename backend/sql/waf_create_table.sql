@@ -1,7 +1,8 @@
--- Creates the Athena table for AWS WAF logs.
--- Assumes logs are delivered by Kinesis Firehose in a JSON format.
+-- AWS WAF v2 logs external table (JSON format)
+-- Partitioned by dt (date) and hr (hour)
+-- LOCATION will be substituted by SAM parameters.
 
-CREATE EXTERNAL TABLE IF NOT EXISTS `${db_name}`.`${waf_logs_table}`(
+CREATE EXTERNAL TABLE IF NOT EXISTS `${database_name}`.`waf_logs`(
   `timestamp` bigint,
   `formatversion` int,
   `webaclid` string,
@@ -31,23 +32,25 @@ CREATE EXTERNAL TABLE IF NOT EXISTS `${db_name}`.`${waf_logs_table}`(
   `labels` array<struct<`name`:string>>
 )
 PARTITIONED BY (
-  -- Partitioning by date for performance, assuming Firehose prefix `YYYY/MM/DD/HH/`
-  `year` string,
-  `month` string,
-  `day` string,
-  `hour` string
+  `dt` string,
+  `hr` string
 )
 ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
-LOCATION 's3://${log_bucket_name}/waf-logs/'
+WITH SERDEPROPERTIES (
+  'ignore.malformed.json' = 'true'
+)
+LOCATION 's3://${log_bucket_name}/waf-logs/' -- LOCATION will be substituted by SAM Parameter
 TBLPROPERTIES (
-    'projection.enabled' = 'true',
-    'projection.year.type' = 'integer',
-    'projection.year.range' = '2022,2100',
-    'projection.month.type' = 'integer',
-    'projection.month.range' = '01,12',
-    'projection.day.type' = 'integer',
-    'projection.day.range' = '01,31',
-    'projection.hour.type' = 'integer',
-    'projection.hour.range' = '00,23',
-    'storage.location.template' = 's3://${log_bucket_name}/waf-logs/${year}/${month}/${day}/${hour}/'
+  'classification'='json',
+  'compressionType'='gzip',
+  'projection.enabled' = 'true',
+  'projection.dt.type' = 'date',
+  'projection.dt.range' = 'NOW-7DAYS,NOW+1DAYS',
+  'projection.dt.format' = 'yyyy-MM-dd',
+  'projection.dt.interval' = '1',
+  'projection.dt.interval.unit' = 'DAYS',
+  'projection.hr.type' = 'integer',
+  'projection.hr.range' = '0,23',
+  'projection.hr.digits' = '2',
+  'storage.location.template' = 's3://${log_bucket_name}/waf-logs/dt=${dt}/hr=${hr}/'
 );

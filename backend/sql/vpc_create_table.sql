@@ -1,8 +1,8 @@
--- Creates the Athena table for VPC Flow Logs.
--- Assumes logs are stored in Parquet format in S3.
--- For text format, change SERDE and INPUTFORMAT accordingly.
+-- VPC Flow Logs external table (JSON or Parquet format)
+-- Partitioned by dt (date) and hr (hour)
+-- LOCATION will be substituted by SAM parameters.
 
-CREATE EXTERNAL TABLE IF NOT EXISTS ${db_name}.${vpc_flow_logs_table} (
+CREATE EXTERNAL TABLE IF NOT EXISTS `${database_name}`.`vpc_flow_logs` (
   version int,
   account_id string,
   interface_id string,
@@ -34,21 +34,25 @@ CREATE EXTERNAL TABLE IF NOT EXISTS ${db_name}.${vpc_flow_logs_table} (
   traffic_path array<int>
 )
 PARTITIONED BY (
-  -- Partitioning by date for performance
-  year STRING,
-  month STRING,
-  day STRING
+  `dt` string,
+  `hr` string
 )
-STORED AS PARQUET
-LOCATION 's3://${log_bucket_name}/vpc-flow-logs/'
+ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe' -- Change to ParquetSerde if using Parquet
+WITH SERDEPROPERTIES (
+  'ignore.malformed.json' = 'true' -- Remove if using Parquet
+)
+LOCATION 's3://${log_bucket_name}/vpc-flow-logs/' -- LOCATION will be substituted by SAM Parameter
 TBLPROPERTIES (
-  -- TODO: Configure partition projection if desired, using config/partition-projection.json
+  'classification'='json', -- Change to parquet if using Parquet
+  'compressionType'='gzip',
   'projection.enabled'='true',
-  'projection.year.type'='integer',
-  'projection.year.range'='2022,2100',
-  'projection.month.type'='integer',
-  'projection.month.range'='01,12',
-  'projection.day.type'='integer',
-  'projection.day.range'='01,31',
-  'storage.location.template'='s3://${log_bucket_name}/vpc-flow-logs/year=${year}/month=${month}/day=${day}'
+  'projection.dt.type'='date',
+  'projection.dt.range'='NOW-7DAYS,NOW+1DAYS',
+  'projection.dt.format'='yyyy-MM-dd',
+  'projection.dt.interval'='1',
+  'projection.dt.interval.unit'='DAYS',
+  'projection.hr.type'='integer',
+  'projection.hr.range'='0,23',
+  'projection.hr.digits'='2',
+  'storage.location.template'='s3://${log_bucket_name}/vpc-flow-logs/dt=${dt}/hr=${hr}/'
 );
