@@ -1,0 +1,15 @@
+{
+    "projection": {
+        "enabled": "true",
+        "type": "date",
+        "range": "2022/01/01,NOW",
+        "format": "yyyy/MM/dd",
+        "interval": "1",
+        "interval.unit": "DAYS"
+    },
+    "storage": {
+        "location": {
+            "template": "s3://<your-log-bucket>/<prefix>/${projection.year}/${projection.month}/${projection.day}/"
+        }
+    }
+}

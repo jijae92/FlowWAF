@@ -1,0 +1,421 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Flow+WAF Anomaly Detection
+  This stack deploys the necessary infrastructure for collecting and analyzing
+  WAF and VPC Flow logs to detect security anomalies.
+
+Parameters:
+  LogsBucketName:
+    Type: String
+    Description: "Name for the S3 bucket to store WAF and VPC Flow logs."
+    Default: "flow-waf-anomaly-detection-logs"
+  AthenaResultsBucketName:
+    Type: String
+    Description: "Name for the S3 bucket to store Athena query results."
+    Default: "flow-waf-anomaly-detection-athena-results"
+  DetectionSchedule:
+    Type: String
+    Description: "Schedule expression for the anomaly detection Lambda (e.g., rate(5 minutes) or cron(0/5 * ? * * *))."
+    Default: "rate(5 minutes)"
+  LookbackMinutes:
+    Type: Number
+    Description: "Number of minutes to look back for log data in Athena queries."
+    Default: 15
+  TrainDays:
+    Type: Number
+    Description: "Number of days of historical data to use for initial baseline training."
+    Default: 7
+  EWMAAlpha:
+    Type: Number
+    Description: "EWMA smoothing factor (alpha) for anomaly detection (0.0 - 1.0)."
+    Default: 0.3
+  Sigma:
+    Type: Number
+    Description: "Number of standard deviations (sigma) from the mean to trigger an anomaly."
+    Default: 3.0
+  TopK:
+    Type: Number
+    Description: "Number of top-K entities to track for anomaly detection."
+    Default: 100
+  SlackWebhookUrl:
+    Type: String
+    Description: "Optional: Slack webhook URL for notifications. Leave empty to disable Slack notifications."
+    Default: ""
+    NoEcho: true # Hide sensitive value
+
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 256
+    Runtime: python3.11
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        ATHENA_DATABASE: !Ref LogAnalysisDB
+        ATHENA_WORKGROUP: !Ref AthenaWorkgroup
+        ATHENA_OUTPUT_LOCATION: !Sub "s3://${AthenaResultsBucketName}/athena-query-results/"
+        SNS_TOPIC_ARN: !Ref AnomalyNotificationTopic
+        BASELINE_BUCKET: !Ref LogsBucketName
+        LOOKBACK_MINUTES: !Ref LookbackMinutes
+        TRAIN_DAYS: !Ref TrainDays
+        EWMA_ALPHA: !Ref EWMAAlpha
+        SIGMA: !Ref Sigma
+        TOP_K: !Ref TopK
+        SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+        LOG_LEVEL: "INFO"
+
+Resources:
+  # --- S3 Buckets for Logs and Athena Results ---
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref LogsBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: LogRetentionRule
+            Status: Enabled
+            ExpirationInDays: 90 # Logs older than 90 days will be deleted
+            # TODO: Consider adding transition to Glacier for older logs if cost is a major concern.
+      Tags:
+        - Key: Project
+          Value: FlowWAFAnomalyDetection
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref AthenaResultsBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: AthenaResultsRetentionRule
+            Status: Enabled
+            ExpirationInDays: 30 # Athena query results older than 30 days will be deleted
+      Tags:
+        - Key: Project
+          Value: FlowWAFAnomalyDetection
+
+  # --- Kinesis Firehose for WAF Logs ---
+  WafLogFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub "${AWS::StackName}-WafLogFirehose"
+      DeliveryStreamType: DirectPut # Assuming WAF directly puts to Firehose
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt LogsBucket.Arn
+        RoleARN: !GetAtt FirehoseS3Role.Arn
+        Prefix: "waf-logs/dt=!{timestamp:yyyy-MM-dd}/hr=!{timestamp:HH}/" # Partition by date and hour
+        ErrorOutputPrefix: "waf-logs-errors/"
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 5
+        CompressionFormat: GZIP # Compress logs to save storage and improve Athena performance
+        # TODO: Consider adding a Lambda transformation for WAF logs if schema changes or enrichment is needed.
+
+  FirehoseS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt LogsBucket.Arn
+                  - !Sub "${LogsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: "*" # TODO: Restrict to specific KMS key if used for S3 encryption
+
+  # --- Glue/Athena for Querying ---
+  LogAnalysisDB:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: "flow_waf_log_analysis_db" # Consistent naming
+        Description: "Database for WAF and VPC Flow Log analysis."
+
+  WafLogsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref LogAnalysisDB
+      TableInput:
+        Name: "waf_logs"
+        Description: "Athena table for AWS WAF logs."
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          "EXTERNAL": "TRUE"
+          "classification": "json"
+          "compressionType": "gzip" # Matches Firehose compression
+          "projection.enabled": "true"
+          "projection.dt.type": "date"
+          "projection.dt.range": "NOW-7DAYS,NOW+1DAYS" # Adjust range as needed
+          "projection.dt.format": "yyyy-MM-dd"
+          "projection.dt.interval": "1"
+          "projection.dt.interval.unit": "DAYS"
+          "projection.hr.type": "integer"
+          "projection.hr.range": "0,23"
+          "projection.hr.digits": "2"
+          "storage.location.template": !Sub "s3://${LogsBucketName}/waf-logs/dt=${dt}/hr=${hr}/"
+        StorageDescriptor:
+          Columns: # Simplified WAF log schema for common fields
+            - Name: "timestamp"
+              Type: "bigint"
+            - Name: "formatversion"
+              Type: "int"
+            - Name: "webaclid"
+              Type: "string"
+            - Name: "terminatingrule"
+              Type: "struct<ruleid:string,action:string>"
+            - Name: "httprequest"
+              Type: "struct<clientip:string,country:string,headers:array<struct<name:string,value:string>>,uri:string,args:string,httpversion:string,httpmethod:string,requestid:string>"
+            - Name: "httpresponse"
+              Type: "struct<status:int,responsecode_sent:int>"
+            - Name: "labels"
+              Type: "array<struct<name:string>>"
+          Location: !Sub "s3://${LogsBucketName}/waf-logs/"
+          InputFormat: "org.apache.hadoop.mapred.TextInputFormat"
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+          SerdeInfo:
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+            Parameters:
+              "ignore.malformed.json": "true" # Important for WAF logs
+        PartitionKeys:
+          - Name: "dt"
+            Type: "string"
+          - Name: "hr"
+            Type: "string"
+
+  VpcFlowLogsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref LogAnalysisDB
+      TableInput:
+        Name: "vpc_flow_logs"
+        Description: "Athena table for VPC Flow logs."
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          "EXTERNAL": "TRUE"
+          "classification": "parquet" # Assuming Parquet for VPC Flow logs
+          "projection.enabled": "true"
+          "projection.year.type": "integer"
+          "projection.year.range": "2022,2100"
+          "projection.month.type": "integer"
+          "projection.month.range": "1,12"
+          "projection.day.type": "integer"
+          "projection.day.range": "1,31"
+          "storage.location.template": !Sub "s3://${LogsBucketName}/vpc-flow-logs/year=${year}/month=${month}/day=${day}/"
+        StorageDescriptor:
+          Columns: # Standard VPC Flow log fields
+            - Name: "version"
+              Type: "int"
+            - Name: "account_id"
+              Type: "string"
+            - Name: "interface_id"
+              Type: "string"
+            - Name: "srcaddr"
+              Type: "string"
+            - Name: "dstaddr"
+              Type: "string"
+            - Name: "srcport"
+              Type: "int"
+            - Name: "dstport"
+              Type: "int"
+            - Name: "protocol"
+              Type: "bigint"
+            - Name: "packets"
+              Type: "bigint"
+            - Name: "bytes"
+              Type: "bigint"
+            - Name: "start"
+              Type: "bigint"
+            - Name: "end"
+              Type: "bigint"
+            - Name: "action"
+              Type: "string"
+            - Name: "log_status"
+              Type: "string"
+          Location: !Sub "s3://${LogsBucketName}/vpc-flow-logs/"
+          InputFormat: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
+          OutputFormat: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"
+          SerdeInfo:
+            SerializationLibrary: "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+        PartitionKeys:
+          - Name: "year"
+            Type: "string"
+          - Name: "month"
+            Type: "string"
+          - Name: "day"
+            Type: "string"
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-AnomalyDetectionWorkgroup"
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucketName}/athena-query-results/"
+        EnforceWorkGroupConfiguration: true # Ensure all queries use this output location
+        PublishCloudWatchMetricsEnabled: true
+      Tags:
+        - Key: Project
+          Value: FlowWAFAnomalyDetection
+
+  # --- SNS for Notifications ---
+  AnomalyNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub "${AWS::StackName}-AnomalyDetectionNotifications"
+      TopicName: !Sub "${AWS::StackName}-anomaly-detection-notifications"
+      Tags:
+        - Key: Project
+          Value: FlowWAFAnomalyDetection
+
+  # --- Lambda Detector Function ---
+  DetectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-AnomalyDetector"
+      CodeUri: ../backend/
+      Handler: lambdas.detector_handler.handler
+      Policies:
+        - Statement: # Minimal Athena/Glue permissions
+            - Effect: Allow
+              Action:
+                - athena:StartQueryExecution
+                - athena:GetQueryExecution
+                - athena:GetQueryResults
+                - athena:StopQueryExecution
+                - glue:GetTable
+                - glue:GetTables
+                - glue:GetDatabase
+                - glue:GetDatabases
+                - glue:GetPartition
+                - glue:GetPartitions
+              Resource: "*" # TODO: Restrict to specific Glue tables and Athena workgroup
+        - S3ReadWritePolicy: # For logs, baselines, and Athena results
+            BucketName: !Ref LogsBucketName
+        - S3ReadWritePolicy:
+            BucketName: !Ref AthenaResultsBucketName
+        - SNSPublishMessagePolicy:
+            TopicArn: !Ref AnomalyNotificationTopic
+        - VPCAccessPolicy: # If Lambda needs to access resources in a VPC (e.g., private Glue endpoints)
+            # TODO: Configure VPC access if needed.
+            # SecurityGroupIds:
+            #   - sg-xxxxxxxxxxxxxxxxx
+            # SubnetIds:
+            #   - subnet-xxxxxxxxxxxxxxxxx
+            # This policy is commented out by default.
+      Tags:
+        - Key: Project
+          Value: FlowWAFAnomalyDetection
+
+  # --- (Optional) Warmup Function ---
+  WarmupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-WarmupDetector"
+      CodeUri: ../backend/
+      Handler: lambdas.warmup_handler.handler
+      Environment:
+        Variables:
+          DETECTOR_LAMBDA_NAME: !Ref DetectorFunction # Pass the detector function name
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DetectorFunction
+      Tags:
+        - Key: Project
+          Value: FlowWAFAnomalyDetection
+
+  # --- Scheduled Trigger for the Detector ---
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Rule to trigger anomaly detection Lambda"
+      ScheduleExpression: !Ref DetectionSchedule
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt DetectorFunction.Arn
+          Id: "DetectorFunctionTarget"
+        - Arn: !GetAtt WarmupFunction.Arn # Optionally trigger warmup function
+          Id: "WarmupFunctionTarget"
+          Input: '{"source": "lambda.warmer"}' # Special event for warmup function
+
+  PermissionForEventsToInvokeDetector:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DetectorFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+  PermissionForEventsToInvokeWarmup:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WarmupFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+Outputs:
+  LogsBucketName:
+    Description: "S3 bucket name for WAF and VPC Flow logs"
+    Value: !Ref LogsBucketName
+  LogsBucketArn:
+    Description: "S3 bucket ARN for WAF and VPC Flow logs"
+    Value: !GetAtt LogsBucket.Arn
+  AthenaResultsBucketName:
+    Description: "S3 bucket name for Athena query results"
+    Value: !Ref AthenaResultsBucketName
+  AthenaResultsBucketArn:
+    Description: "S3 bucket ARN for Athena query results"
+    Value: !GetAtt AthenaResultsBucket.Arn
+  WafLogFirehoseName:
+    Description: "Kinesis Firehose Delivery Stream name for WAF logs"
+    Value: !Ref WafLogFirehose
+  AnomalyNotificationTopicArn:
+    Description: "SNS Topic ARN for anomaly notifications"
+    Value: !Ref AnomalyNotificationTopic
+  DetectorFunctionName:
+    Description: "Anomaly Detector Lambda Function Name"
+    Value: !Ref DetectorFunction
+  DetectorFunctionArn:
+    Description: "Anomaly Detector Lambda Function ARN"
+    Value: !GetAtt DetectorFunction.Arn
+  WarmupFunctionName:
+    Description: "Warmup Lambda Function Name"
+    Value: !Ref WarmupFunction
+  WarmupFunctionArn:
+    Description: "Warmup Lambda Function ARN"
+    Value: !GetAtt WarmupFunction.Arn

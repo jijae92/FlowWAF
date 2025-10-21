@@ -1,0 +1,45 @@
+# Indicators of Compromise (IOC)
+# This file is loaded by the detector to enrich findings.
+
+# Malicious IP ranges or specific IPs
+cidrs:
+  - '1.2.3.4/32'
+  - '103.21.244.0/22' # Example known bad network
+
+# Malicious Autonomous System Numbers
+asn:
+  - 'AS12345' # Example known bad ASN
+
+# ISO 3166-1 alpha-2 country codes to monitor
+country:
+  - 'KP' # North Korea
+  - 'RU' # Russia
+  - 'CN' # China
+
+# Exact match for suspicious User-Agents
+ua:
+  - 'masscan'
+  - 'ZGrab'
+
+# Exact match for suspicious URIs (e.g., scanner probes)
+uri:
+  - '/.env'
+  - '/phpmyadmin/'
+
+# Regex patterns for more complex matching
+regex:
+  # Patterns to match against the User-Agent header
+  ua:
+    - '(?i)sqlmap'
+    - '(?i)nikto'
+    - '(?i)nmap'
+    - '(?i)curl|wget' # Could be noisy, for example only
+
+  # Patterns to match against the URI (path + query string)
+  uri:
+    - '/etc/passwd'
+    - '(?i)SELECT.*FROM'
+    - '(?i)UNION.*SELECT'
+    - '(?i)<script>alert'
+    - '(?i)xss'
+    - '(?i)lfi'
